@@ -75,7 +75,8 @@ async function checkReset() {
           await reviewChannel.send(
             `🔔 **Daily Trustpilot review slots are now open!**\n\n` +
             `**${MAX_SLOTS_PER_DAY} spots available** — first come, first served.\n\n` +
-            `Had a great session recently? Ask your customer to leave a review on Trustpilot, then paste the link here to earn **$1 credit for you and your customer!** 🎉\n\n` +
+            `Had a great session recently? Ask your customer to leave a review on Trustpilot, then paste the link here.\n` +
+            `You'll earn a **$1 bonus**, and your customer gets **$1 credit**! 🎉\n\n` +
             `Slots reset every day at 3 PM PT.`
           );
           state.dailyPingSentAt = now.toISOString();
@@ -322,7 +323,7 @@ client.on('messageCreate', async (message) => {
     await message.react('✅');
     await message.reply(
       `✅ **Review submitted!** Order \`${orderId}\` logged.\n` +
-      `You'll receive $1 credit, and your teammate gets $1 too! 🎉\n` +
+      `You'll receive a **$1 bonus**, and your customer gets **$1 credit**! 🎉\n` +
       `**${slotsLeft} slot${slotsLeft !== 1 ? 's' : ''} remaining today.**`
     );
 
