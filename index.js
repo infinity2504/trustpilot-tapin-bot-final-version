@@ -12,11 +12,12 @@ const DATA_FILE = './data.json';
 
 // ─── State ───
 let state = {
-  approvedToday: [],      // [{ userId, url, orderId, timestamp }]
-  allUrls: [],            // all-time submitted URLs (dedup)
-  lastReset: null,        // ISO string of last reset
+  approvedToday: [],       // [{ userId, url, orderId, timestamp }]
+  allUrls: [],             // all-time submitted URLs (dedup)
+  lastReset: null,         // ISO string of last reset
   userSubmittedToday: [],  // userIds who already submitted today
-  submissions: []          // all-time log: [{ userId, username, url, orderId, verified, timestamp }]
+  submissions: [],          // all-time log: [{ userId, username, url, orderId, verified, timestamp }]
+  dailyPingSentAt: null    // ISO string of last daily ping sent (to avoid double-pinging)
 };
 
 // Pending order ID collection: userId -> { url, messageId, timeout }
@@ -29,8 +30,8 @@ function loadState() {
       const raw = fs.readFileSync(DATA_FILE, 'utf8');
       const loaded = JSON.parse(raw);
       state = { ...state, ...loaded };
-      // Ensure submissions array exists for upgrades from old data
       if (!state.submissions) state.submissions = [];
+      if (!state.dailyPingSentAt) state.dailyPingSentAt = null;
     }
   } catch (e) {
     console.error('Failed to load state:', e.message);
@@ -45,8 +46,8 @@ function saveState() {
   }
 }
 
-// ─── Daily Reset ───
-function checkReset() {
+// ─── Daily Reset + Ping ───
+async function checkReset() {
   const now = new Date();
   const lastReset = state.lastReset ? new Date(state.lastReset) : null;
 
@@ -54,12 +55,37 @@ function checkReset() {
     now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), RESET_HOUR_UTC, 0, 0
   ));
 
-  if (now >= todayReset && (!lastReset || lastReset < todayReset)) {
+  const didReset = now >= todayReset && (!lastReset || lastReset < todayReset);
+
+  if (didReset) {
     state.approvedToday = [];
     state.userSubmittedToday = [];
     state.lastReset = now.toISOString();
     saveState();
     console.log(`Daily reset at ${now.toISOString()}`);
+
+    // ─── Daily "slots open" ping ───
+    const lastPing = state.dailyPingSentAt ? new Date(state.dailyPingSentAt) : null;
+    const alreadyPingedToday = lastPing && lastPing >= todayReset;
+
+    if (!alreadyPingedToday && REVIEW_CHANNEL_ID) {
+      try {
+        const reviewChannel = await client.channels.fetch(REVIEW_CHANNEL_ID);
+        if (reviewChannel) {
+          await reviewChannel.send(
+            `🔔 **Daily Trustpilot review slots are now open!**\n\n` +
+            `**${MAX_SLOTS_PER_DAY} spots available** — first come, first served.\n\n` +
+            `Had a great session recently? Ask your customer to leave a review on Trustpilot, then paste the link here to earn **$1 credit for you and your customer!** 🎉\n\n` +
+            `Slots reset every day at 3 PM PT.`
+          );
+          state.dailyPingSentAt = now.toISOString();
+          saveState();
+          console.log('Daily ping sent.');
+        }
+      } catch (e) {
+        console.error('Failed to send daily ping:', e.message);
+      }
+    }
   }
 }
 
@@ -127,17 +153,14 @@ function verifyReviewMentionsTapin(url) {
           const lower = body.toLowerCase();
           const isTapin = lower.includes('tapin');
 
-          // Try to extract reviewer name and star rating from page
           let reviewerName = null;
           let starRating = null;
 
-          // Extract reviewer name from various patterns
           const nameMatch = body.match(/data-consumer-name="([^"]+)"/i) ||
                            body.match(/"displayName"\s*:\s*"([^"]+)"/i) ||
                            body.match(/by\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s*<\/span/i);
           if (nameMatch) reviewerName = nameMatch[1];
 
-          // Extract star rating
           const ratingMatch = body.match(/data-rating="(\d)"/i) ||
                              body.match(/"ratingValue"\s*:\s*(\d)/i) ||
                              body.match(/gave\s+tapin\.gg\s+(\d)\s+star/i);
@@ -159,7 +182,6 @@ function verifyReviewMentionsTapin(url) {
 // ─── Order ID Validation ───
 function isValidOrderId(text) {
   const trimmed = text.trim();
-  // Accept numeric order IDs (common format) or alphanumeric with reasonable length
   return /^\d{3,10}$/.test(trimmed) || /^[A-Za-z0-9_-]{3,20}$/.test(trimmed);
 }
 
@@ -304,6 +326,35 @@ client.on('messageCreate', async (message) => {
       `**${slotsLeft} slot${slotsLeft !== 1 ? 's' : ''} remaining today.**`
     );
 
+    // ─── Thank-you public message (no name mention) ───
+    try {
+      const reviewChannel = await client.channels.fetch(REVIEW_CHANNEL_ID);
+      if (reviewChannel) {
+        const starDisplay = pending.starRating ? '⭐'.repeat(pending.starRating) : '⭐⭐⭐⭐⭐';
+        await reviewChannel.send(
+          `🌟 **A new Trustpilot review has been submitted!** ${starDisplay}\n` +
+          `Thank you for helping build Tapin's reputation — every review makes a difference! 💚\n` +
+          `**${slotsLeft} slot${slotsLeft !== 1 ? 's' : ''} remaining today.**`
+        );
+      }
+    } catch (e) {
+      console.error('Failed to send thank-you message:', e.message);
+    }
+
+    // ─── Low-slot warning ───
+    if (slotsLeft === 1) {
+      try {
+        const reviewChannel = await client.channels.fetch(REVIEW_CHANNEL_ID);
+        if (reviewChannel) {
+          await reviewChannel.send(
+            `⚠️ **Only 1 review slot left for today!** First to submit gets it. Slots reset at 3 PM PT.`
+          );
+        }
+      } catch (e) {
+        console.error('Failed to send low-slot warning:', e.message);
+      }
+    }
+
     // ─── Notify ops ───
     if (OPS_CHANNEL_ID) {
       try {
@@ -360,10 +411,23 @@ client.on('messageCreate', async (message) => {
 
   // ─── Validate review ───
   await message.react('🔍');
-  const { verified, reviewerName, starRating } = await verifyReviewMentionsTapin(url);
-  if (!verified) {
-    await message.reply('❌ Couldn\'t verify this is a Tapin review. Make sure the link goes directly to your Trustpilot review of Tapin.gg.');
-    return;
+
+  // Individual review URLs (/reviews/{id}) are JS-rendered by Trustpilot — our HTTP fetch
+  // cannot detect "tapin" in the raw HTML. Trust them directly based on URL structure alone.
+  const parsedReviewUrl = new URL(url);
+  const isIndividualReview = /^\/reviews\/[a-f0-9]+$/i.test(parsedReviewUrl.pathname);
+
+  let verified, reviewerName, starRating;
+  if (isIndividualReview) {
+    verified = true;
+    reviewerName = null;
+    starRating = null;
+  } else {
+    ({ verified, reviewerName, starRating } = await verifyReviewMentionsTapin(url));
+    if (!verified) {
+      await message.reply('❌ Couldn\'t verify this is a Tapin review. Make sure the link goes directly to your Trustpilot review of Tapin.gg.');
+      return;
+    }
   }
 
   // ─── Ask for order ID ───
